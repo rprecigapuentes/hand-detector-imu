@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 import time
+import warnings
 import joblib
 import numpy as np
-import pandas as pd
 from smbus2 import SMBus
+
+# Silenciar el warning de sklearn: "X does not have valid feature names..."
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names",
+    category=UserWarning
+)
 
 # =============================
 # CONFIG
@@ -11,11 +18,11 @@ from smbus2 import SMBus
 I2C_BUS = 1
 MPU_ADDR = 0x68
 
-MODEL_PATH = "modelo_rf.sav"   # tu .sav
-SAMPLE_RATE_HZ = 20
+MODEL_PATH = "modelo_rf.sav"   # cambia por tu .sav (RF o DT)
+SAMPLE_RATE_HZ = 20            # ~20 Hz como en tu ESP (delay 50 ms)
 SLEEP = 1.0 / SAMPLE_RATE_HZ
 
-# Offsets crudos (LSB), mismos que en tu ESP32-C3
+# Offsets crudos (LSB), iguales a tu ESP32-C3
 AX_OFF = -4645
 AY_OFF = -5769
 AZ_OFF = 10448
@@ -28,9 +35,6 @@ ACCEL_SENS_2G = 16384.0
 GYRO_SENS_250 = 131.0
 G_TO_MS2 = 9.80665
 
-# Columnas EXACTAS usadas en el entrenamiento (en este orden)
-FEATURE_COLS = ["ax_ms2","ay_ms2","az_ms2","gx_dps","gy_dps","gz_dps"]
-
 # Registros MPU6050
 PWR_MGMT_1   = 0x6B
 SMPLRT_DIV   = 0x19
@@ -40,16 +44,22 @@ ACCEL_CONFIG = 0x1C
 ACCEL_XOUT_H = 0x3B
 
 def mpu6050_init(bus):
+    # Despertar
     bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)
     time.sleep(0.1)
-    bus.write_byte_data(MPU_ADDR, CONFIG, 0x02)     # DLPF ~94 Hz
-    bus.write_byte_data(MPU_ADDR, GYRO_CONFIG, 0x00) # ±250 dps
-    bus.write_byte_data(MPU_ADDR, ACCEL_CONFIG, 0x00)# ±2 g
-    div = max(0, int(1000 / SAMPLE_RATE_HZ) - 1)    # 1kHz/(1+div)
+    # Filtro DLPF ~94 Hz
+    bus.write_byte_data(MPU_ADDR, CONFIG, 0x02)
+    # Gyro ±250 dps
+    bus.write_byte_data(MPU_ADDR, GYRO_CONFIG, 0x00)
+    # Accel ±2 g
+    bus.write_byte_data(MPU_ADDR, ACCEL_CONFIG, 0x00)
+    # Sample rate = 1kHz/(1+div) con DLPF ON
+    div = max(0, int(1000 / SAMPLE_RATE_HZ) - 1)
     bus.write_byte_data(MPU_ADDR, SMPLRT_DIV, div)
     time.sleep(0.05)
 
-def s16(x): return x - 65536 if x >= 32768 else x
+def s16(x):
+    return x - 65536 if x >= 32768 else x
 
 def read_mpu6050(bus):
     d = bus.read_i2c_block_data(MPU_ADDR, ACCEL_XOUT_H, 14)
@@ -63,21 +73,21 @@ def read_mpu6050(bus):
     ax_ms2 = (ax / ACCEL_SENS_2G) * G_TO_MS2
     ay_ms2 = (ay / ACCEL_SENS_2G) * G_TO_MS2
     az_ms2 = (az / ACCEL_SENS_2G) * G_TO_MS2
-    gx_dps =  gx / GYRO_SENS_250
-    gy_dps =  gy / GYRO_SENS_250
-    gz_dps =  gz / GYRO_SENS_250
+
+    gx_dps = gx / GYRO_SENS_250
+    gy_dps = gy / GYRO_SENS_250
+    gz_dps = gz / GYRO_SENS_250
 
     return ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps
 
 def main():
+    # Cargar modelo
     clf = joblib.load(MODEL_PATH)
     has_proba = hasattr(clf, "predict_proba")
 
     with SMBus(I2C_BUS) as bus:
         mpu6050_init(bus)
         print("[INFO] Leyendo y prediciendo… Ctrl+C para salir\n")
-
-        # Imprime encabezado legible una vez
         print("time       pred     p   |    ax(ms^2)    ay(ms^2)    az(ms^2)   |   gx(dps)    gy(dps)    gz(dps)")
         print("-"*96)
 
@@ -85,25 +95,19 @@ def main():
             try:
                 ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps = read_mpu6050(bus)
 
-                # DataFrame con nombres de columnas para evitar el warning
-                X = pd.DataFrame([{
-                    "ax_ms2": ax_ms2, "ay_ms2": ay_ms2, "az_ms2": az_ms2,
-                    "gx_dps": gx_dps, "gy_dps": gy_dps, "gz_dps": gz_dps
-                }], columns=FEATURE_COLS)
+                # ndarray puro, sin pandas
+                X = np.array([[ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps]], dtype=float)
 
                 y = clf.predict(X)[0]
-                p = ""
                 if has_proba:
                     proba_vec = clf.predict_proba(X)[0]
                     # prob de la clase predicha
-                    # cuidado: classes_ puede no estar indexada 0..n igual que y
                     cls_idx = list(clf.classes_).index(y)
                     p = f"{proba_vec[cls_idx]:.2f}"
                 else:
                     p = "--"
 
                 t = time.strftime("%H:%M:%S")
-                # Formato con ancho fijo
                 print(f"{t}  {str(y):<7} {p:>5} | "
                       f"{ax_ms2:>11.3f}  {ay_ms2:>11.3f}  {az_ms2:>11.3f} | "
                       f"{gx_dps:>9.2f}  {gy_dps:>9.2f}  {gz_dps:>9.2f}")
