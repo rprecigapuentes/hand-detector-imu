@@ -1,114 +1,117 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time
-import warnings
-import joblib
+import time, math, json, warnings
 import numpy as np
 from smbus2 import SMBus
+from joblib import load
 
-# Silencia el warning de sklearn por "feature names"
+# ---------- SILENCIAR WARNINGS ----------
 warnings.filterwarnings(
     "ignore",
     message="X does not have valid feature names",
     category=UserWarning
 )
 
-# =============================
-# CONFIG
-# =============================
-I2C_BUS = 1            # GPIO2 (SDA) y GPIO3 (SCL) en Raspberry
-MPU_ADDR = 0x68
-MODEL_PATH = "modelo_rf.sav"   # tu .sav (RF o DT)
+# ---------- CONFIG ----------
+I2C_BUS    = 1
+MPU_ADDR   = 0x68
+MODEL_PATH = "modelo_rf.sav"
+OFFSETS_PATH = "mpu6050_offsets.json"
 
-# Misma cadencia que en la ESP (~20 Hz)
-SAMPLE_RATE_HZ = 20
-SLEEP = 1.0 / SAMPLE_RATE_HZ
-
-# Offsets crudos (LSB) — los mismos que usaste en ESP32-C3
-AX_OFF = -4645
-AY_OFF = -5769
-AZ_OFF = 10448
-GX_OFF = 47
-GY_OFF = -148
-GZ_OFF = -10
-
-# Escalas (±2 g y ±250 dps como en tu código)
-ACCEL_SENS_2G = 16384.0  # LSB por g
-GYRO_SENS_250 = 131.0    # LSB por dps
-G_TO_MS2 = 9.80665
-
-# Registros mínimos
+# Registros MPU6050
+WHO_AM_I     = 0x75
 PWR_MGMT_1   = 0x6B
+SMPLRT_DIV   = 0x19
+CONFIG       = 0x1A
+GYRO_CONFIG  = 0x1B
+ACCEL_CONFIG = 0x1C
 ACCEL_XOUT_H = 0x3B
 
-def wake_up(bus):
-    # Despertar el MPU6050 (sin tocar filtros ni rangos)
-    bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)
-    time.sleep(0.1)
+# Conversión (±2 g, ±250 dps)
+G_TO_MS2       = 9.80665
+ACC_LSB_PER_G  = 16384.0
+GYR_LSB_PER_D  = 131.0
 
-def s16(x):
-    # Convierte unsigned 16 a signed 16
+def s16(x): 
     return x - 65536 if x >= 32768 else x
 
-def read_raw_block(bus):
-    # Lee 14 bytes: Ax,Ay,Az,Temp,Gx,Gy,Gz (cada uno 16 bits)
-    return bus.read_i2c_block_data(MPU_ADDR, ACCEL_XOUT_H, 14)
+def read_block(bus):
+    d = bus.read_i2c_block_data(MPU_ADDR, ACCEL_XOUT_H, 14)
+    ax = s16((d[0] << 8)  | d[1])
+    ay = s16((d[2] << 8)  | d[3])
+    az = s16((d[4] << 8)  | d[5])
+    gx = s16((d[8] << 8)  | d[9])
+    gy = s16((d[10] << 8) | d[11])
+    gz = s16((d[12] << 8) | d[13])
+    return ax, ay, az, gx, gy, gz
 
-def read_once(bus):
-    d  = read_raw_block(bus)
-    ax = s16((d[0] << 8)  | d[1])  - AX_OFF
-    ay = s16((d[2] << 8)  | d[3])  - AY_OFF
-    az = s16((d[4] << 8)  | d[5])  - AZ_OFF
-    gx = s16((d[8] << 8)  | d[9])  - GX_OFF
-    gy = s16((d[10] << 8) | d[11]) - GY_OFF
-    gz = s16((d[12] << 8) | d[13]) - GZ_OFF
-
-    # Unidades físicas idénticas a tu ESP
-    ax_ms2 = (ax / ACCEL_SENS_2G) * G_TO_MS2
-    ay_ms2 = (ay / ACCEL_SENS_2G) * G_TO_MS2
-    az_ms2 = (az / ACCEL_SENS_2G) * G_TO_MS2
-    gx_dps =  gx / GYRO_SENS_250
-    gy_dps =  gy / GYRO_SENS_250
-    gz_dps =  gz / GYRO_SENS_250
-
-    return ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps
+def force_config(bus):
+    bus.write_byte_data(MPU_ADDR, PWR_MGMT_1, 0x00)
+    time.sleep(0.05)
+    bus.write_byte_data(MPU_ADDR, CONFIG,       0x03)  # DLPF=3
+    bus.write_byte_data(MPU_ADDR, GYRO_CONFIG,  0x00)  # ±250 dps
+    bus.write_byte_data(MPU_ADDR, ACCEL_CONFIG, 0x00)  # ±2 g
+    bus.write_byte_data(MPU_ADDR, SMPLRT_DIV,   49)    # ~20 Hz
+    time.sleep(0.05)
 
 def main():
-    # Carga modelo (ideal: Pipeline con el mismo preprocesamiento de entrenamiento)
-    clf = joblib.load(MODEL_PATH)
-    has_proba = hasattr(clf, "predict_proba")
+    # Cargar offsets
+    with open(OFFSETS_PATH, "r") as f:
+        off = json.load(f)
+    AX_OFF, AY_OFF, AZ_OFF = int(off["AX_OFF"]), int(off["AY_OFF"]), int(off["AZ_OFF"])
+    GX_OFF, GY_OFF, GZ_OFF = int(off["GX_OFF"]), int(off["GY_OFF"]), int(off["GZ_OFF"])
+
+    # Cargar modelo
+    model = load(MODEL_PATH)
+    has_proba = hasattr(model, "predict_proba")
 
     with SMBus(I2C_BUS) as bus:
-        wake_up(bus)
-        print("[INFO] Leyendo y prediciendo… Ctrl+C para salir\n")
-        print("time       pred     p   |    ax(ms^2)    ay(ms^2)    az(ms^2)   |   gx(dps)    gy(dps)    gz(dps)")
-        print("-"*96)
+        who = bus.read_byte_data(MPU_ADDR, WHO_AM_I)
+        if who not in (0x68, 0x69, 0x70):
+            print(f"[AVISO] WHO_AM_I=0x{who:02X}, revisa conexión I2C.")
+        force_config(bus)
 
-        while True:
-            try:
-                ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps = read_once(bus)
+        print("=============================================")
+        print(" Predicción en tiempo real del modelo RF")
+        print(" (aceleraciones en m/s², giros en °/s)")
+        print("=============================================")
+        print("Etiqueta | Prob | ax    ay    az    | gx    gy    gz")
+        print("------------------------------------------------------")
 
-                # Vector crudo en el ORDEN exacto del entrenamiento
+        try:
+            while True:
+                ax_r, ay_r, az_r, gx_r, gy_r, gz_r = read_block(bus)
+
+                # Aplicar offsets (LSB)
+                ax = ax_r - AX_OFF
+                ay = ay_r - AY_OFF
+                az = az_r - AZ_OFF
+                gx = gx_r - GX_OFF
+                gy = gy_r - GY_OFF
+                gz = gz_r - GZ_OFF
+
+                # Convertir a unidades físicas
+                ax_ms2 = (ax / ACC_LSB_PER_G) * G_TO_MS2
+                ay_ms2 = (ay / ACC_LSB_PER_G) * G_TO_MS2
+                az_ms2 = (az / ACC_LSB_PER_G) * G_TO_MS2
+                gx_dps = gx / GYR_LSB_PER_D
+                gy_dps = gy / GYR_LSB_PER_D
+                gz_dps = gz / GYR_LSB_PER_D
+
+                # Vector [ax, ay, az, gx, gy, gz]
                 X = np.array([[ax_ms2, ay_ms2, az_ms2, gx_dps, gy_dps, gz_dps]], dtype=float)
 
-                y = clf.predict(X)[0]
-                if has_proba:
-                    proba_vec = clf.predict_proba(X)[0]
-                    cls_idx = list(clf.classes_).index(y)
-                    p = f"{proba_vec[cls_idx]:.2f}"
-                else:
-                    p = "--"
+                y = model.predict(X)[0]
+                p = model.predict_proba(X)[0][list(model.classes_).index(y)] if has_proba else 1.0
 
-                t = time.strftime("%H:%M:%S")
-                print(f"{t}  {str(y):<7} {p:>5} | "
-                      f"{ax_ms2:>11.3f}  {ay_ms2:>11.3f}  {az_ms2:>11.3f} | "
-                      f"{gx_dps:>9.2f}  {gy_dps:>9.2f}  {gz_dps:>9.2f}")
+                print(f"{y:<9} | {p:>4.2f} | "
+                      f"{ax_ms2:>5.2f} {ay_ms2:>5.2f} {az_ms2:>5.2f} | "
+                      f"{gx_dps:>5.2f} {gy_dps:>5.2f} {gz_dps:>5.2f}")
 
-                time.sleep(SLEEP)
-            except KeyboardInterrupt:
-                print("\n[INFO] Saliendo limpio.")
-                break
+                time.sleep(0.05)  # ~20 Hz
+        except KeyboardInterrupt:
+            print("\n[FIN] Detenido por el usuario.")
 
 if __name__ == "__main__":
     main()
